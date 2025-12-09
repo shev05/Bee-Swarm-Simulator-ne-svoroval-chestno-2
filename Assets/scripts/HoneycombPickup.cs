@@ -1,312 +1,283 @@
 using UnityEngine;
-using System.Collections;
 
-public class HoneycombPickup : MonoBehaviour
+[RequireComponent(typeof(TimedVisualSwitcher))]
+public class CombPickup : MonoBehaviour
 {
-    [Header("Настройки переноса")]
+    [Header("Управление")]
     public KeyCode pickupKey = KeyCode.E;
-    public float pickupDistance = 3f;
-    public float holdDistance = 2f;
-    public float smoothSpeed = 10f;
-    
-    [Header("Настройки вращения")]
-    public bool allowRotation = true;
-    public float rotationSpeed = 2f;
     public KeyCode rotateLeftKey = KeyCode.Q;
     public KeyCode rotateRightKey = KeyCode.R;
-    
-    [Header("Эффекты")]
-    public ParticleSystem pickupParticles;
-    public AudioClip pickupSound;
-    public AudioClip dropSound;
-    
-    // Ссылка на TimedVisualSwitcher если есть
-    private TimedVisualSwitcher visualSwitcher;
+
+    [Header("Параметры")]
+    public float pickupDistance = 3.5f;
+    public float holdDistance = 1.8f;
+    public float smoothSpeed = 18f;
+    public float rotationSpeed = 200f;
+    public float ghostAlpha = 0.45f;
+
+    [Header("Тестовый режим")]
+    [Tooltip("Разрешить поднимать соту даже если она не полная (для тестов)")]
+    public bool allowPickupWithoutFullFill = false;
+
+    public TimedVisualSwitcher visual;
     private Rigidbody rb;
-    private Collider objectCollider;
-    private AudioSource audioSource;
-    
-    // Переменные переноса
-    private bool isCarrying = false;
-    private Transform carriedObject;
-    private Vector3 targetPosition;
-    private Quaternion targetRotation;
-    
-    // Оригинальные настройки
-    private bool wasKinematic;
-    private bool usedGravity;
-    private Vector3 originalPosition;
-    private Quaternion originalRotation;
-    
+    private Collider col;
+    private Transform camTransform;
+
+    public bool isHeld = false;
+    private Transform originalParent;
+    private Vector3 originalLocalPos;
+    private Quaternion originalLocalRot;
+    private Vector3 originalLocalScale;
+    private CombSlot lookingAtSlot;
+    public Vector3 OriginalScale => originalLocalScale;
+
+
+    public GameObject ghost;
+
+    void Awake()
+    {
+        visual = GetComponent<TimedVisualSwitcher>();
+        rb = GetComponent<Rigidbody>();
+        col = GetComponent<Collider>();
+
+        originalParent = transform.parent;
+        originalLocalPos = transform.localPosition;
+        originalLocalRot = transform.localRotation;
+        originalLocalScale = transform.localScale;
+    }
+
     void Start()
     {
-        // Получаем компоненты
-        visualSwitcher = GetComponent<TimedVisualSwitcher>();
-        rb = GetComponent<Rigidbody>();
-        objectCollider = GetComponent<Collider>();
-        audioSource = GetComponent<AudioSource>();
-        
-        // Сохраняем оригинальные позицию и поворот
-        originalPosition = transform.position;
-        originalRotation = transform.rotation;
-        
-        // Создаем AudioSource если нет
-        if (audioSource == null)
-            audioSource = gameObject.AddComponent<AudioSource>();
+        camTransform = Camera.main?.transform;
+        if (!camTransform) camTransform = FindObjectOfType<AudioListener>()?.transform;
+        if (!camTransform) { Debug.LogError("Камера не найдена!"); enabled = false; return; }
+
+        CreateGhost();
     }
-    
+
+    void CreateGhost()
+    {
+        ghost = Instantiate(gameObject);
+        ghost.name = "[GHOST] " + name;
+
+        Destroy(ghost.GetComponent<CombPickup>());
+        if (ghost.TryGetComponent(out Rigidbody r)) Destroy(r);
+        foreach (var c in ghost.GetComponentsInChildren<Collider>()) Destroy(c);
+
+        foreach (var rend in ghost.GetComponentsInChildren<Renderer>())
+        {
+            var mat = new Material(Shader.Find("Standard"));
+            mat.SetFloat("_Mode", 2);
+            mat.SetInt("_SrcBlend", (int)UnityEngine.Rendering.BlendMode.SrcAlpha);
+            mat.SetInt("_DstBlend", (int)UnityEngine.Rendering.BlendMode.OneMinusSrcAlpha);
+            mat.SetInt("_ZWrite", 0);
+            mat.EnableKeyword("_ALPHABLEND_ON");
+            mat.renderQueue = 3000;
+            mat.color = new Color(1f, 1f, 0.7f, ghostAlpha);
+            rend.material = mat;
+            rend.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
+        }
+
+        ghost.transform.SetParent(originalParent);
+        ghost.transform.localPosition = originalLocalPos;
+        ghost.transform.localRotation = originalLocalRot;
+        ghost.transform.localScale = originalLocalScale;
+
+        ghost.SetActive(false);
+    }
+
     void Update()
     {
-        HandlePickupInput();
-        
-        if (isCarrying)
-        {
-            UpdateCarriedObject();
-            HandleRotationInput();
-            
-            // Проверяем не вышел ли объект из зоны досягаемости
-            if (ShouldDropObject())
-            {
-                DropObject();
-            }
-        }
-    }
-    
-    void HandlePickupInput()
-    {
+        if (!camTransform) return;
+
         if (Input.GetKeyDown(pickupKey))
         {
-            if (!isCarrying)
+            if (isHeld)
             {
-                TryPickup();
+                CheckSlot();
+
+                if (lookingAtSlot)
+                {
+                    lookingAtSlot.PlaceComb(this);
+                    return;  // ← ЭТО ЗАКРЫВАЕТ ИФФЫ, предотвращает Drop()
+                }
+
+                Drop();
+                return;
             }
             else
             {
-                DropObject();
+                TryPickup();
             }
         }
+
+        if (isHeld)
+        {
+            CheckSlot();
+            HandleRotation();
+        }
+    }
+
+    
+    RaycastHit? RaycastFirstNonSelf(Transform from, Vector3 dir, float maxDistance)
+    {
+        RaycastHit[] hits = Physics.RaycastAll(from.position, dir, maxDistance);
+        if (hits == null || hits.Length == 0) return null;
+
+        // сортируем по расстоянию
+        System.Array.Sort(hits, (a, b) => a.distance.CompareTo(b.distance));
+
+        foreach (var hit in hits)
+        {
+            // пропускаем если попали в саму соту (ее любой дочерний трансформ)
+            if ((hit.transform.IsChildOf(transform) || hit.transform == transform) && isHeld)
+                continue;
+
+            // пропускаем ghost (если он есть)
+            if (ghost && (hit.transform.IsChildOf(ghost.transform) || hit.transform == ghost.transform))
+                continue;
+
+            // найден подходящий хит
+            return hit;
+        }
+
+        return null;
     }
     
+    void CheckSlot()
+    {
+        lookingAtSlot = null;
+
+        var hitNullable = RaycastFirstNonSelf(camTransform, camTransform.forward, pickupDistance);
+        if (!hitNullable.HasValue) return;
+
+        var hit = hitNullable.Value;
+
+        // Ищем CombSlot на хитнутом коллайдере или в родителях
+        var slot = hit.collider.GetComponent<CombSlot>();
+        if (slot == null)
+            slot = hit.collider.GetComponentInParent<CombSlot>();
+
+        lookingAtSlot = slot;
+    }
+
+
+
+    void LateUpdate()
+    {
+        if (!isHeld || !camTransform) return;
+
+        // Только позиция — без принудительного поворота!
+        Vector3 targetPos = camTransform.position + camTransform.forward * holdDistance;
+        transform.position = Vector3.Lerp(transform.position, targetPos, smoothSpeed * Time.deltaTime);
+
+        // ← УБРАЛИ ПРИНУДИТЕЛЬНОЕ ВРАЩЕНИЕ К КАМЕРЕ — теперь Q/R работает!
+    }
+
     void TryPickup()
     {
-        // Проверяем что игрок смотрит на этот объект и он достаточно близко
-        if (IsPlayerLookingAtObject() && IsWithinPickupDistance())
+        if (!IsLookingAtMe()) return;
+
+        bool isFull = visual.GetCurrentStage() >= visual.visualStagePrefabs.Length - 1;
+
+        if (!isFull && !allowPickupWithoutFullFill)
         {
-            PickupObject();
+            Debug.Log($"Сота не полная! Стадия: {visual.GetCurrentStage() + 1}/{visual.visualStagePrefabs.Length}");
+            return;
         }
+
+        if (!isFull) Debug.Log("Взята неполная сота (тестовый режим)");
+
+        Pickup();
     }
-    
-    bool IsPlayerLookingAtObject()
+
+    bool IsLookingAtMe()
     {
-        Camera playerCamera = Camera.main;
-        if (playerCamera == null) return false;
-        
-        Ray ray = new Ray(playerCamera.transform.position, playerCamera.transform.forward);
-        RaycastHit hit;
-        
-        if (Physics.Raycast(ray, out hit, pickupDistance))
+        Ray ray = new Ray(camTransform.position, camTransform.forward);
+
+        var hitNullable = RaycastFirstNonSelf(camTransform, camTransform.forward, pickupDistance);
+        if (!hitNullable.HasValue) return false;
+
+        RaycastHit hit = hitNullable.Value;
+
+        // Проверяем — попали ли именно в эту соту (в её Mesh/Collider)
+        // Мы пропускали свои коллайдеры выше, но здесь хотим удостовериться, что цель — этот объект.
+        if (hit.collider != null)
         {
-            return hit.collider.gameObject == gameObject;
+            // если хит попал в объект, который является ребёнком этой соты => true
+            if (hit.transform.IsChildOf(transform) || hit.transform == transform) return true;
+
+            // или если попал ровно в этот объект
+            if (hit.transform.gameObject == gameObject) return true;
         }
-        
+
         return false;
     }
-    
-    bool IsWithinPickupDistance()
+
+
+    void Pickup()
     {
-        Camera playerCamera = Camera.main;
-        if (playerCamera == null) return false;
-        
-        float distance = Vector3.Distance(transform.position, playerCamera.transform.position);
-        return distance <= pickupDistance;
-    }
-    
-    void PickupObject()
-    {
-        isCarrying = true;
-        carriedObject = transform;
-        
-        // Сохраняем оригинальные настройки физики
-        if (rb != null)
+        isHeld = true;
+        transform.SetParent(null);
+
+        if (rb)
         {
-            wasKinematic = rb.isKinematic;
-            usedGravity = rb.useGravity;
-            
-            // Отключаем физику при переносе
             rb.isKinematic = true;
             rb.useGravity = false;
+            rb.constraints = RigidbodyConstraints.None; // <- важно!
         }
-        
-        // Отключаем коллайдер или делаем его триггером
-        if (objectCollider != null)
+
+        if (col) col.isTrigger = true;
+        visual.enabled = false;
+        if (ghost) ghost.SetActive(true);
+
+        Debug.Log("Сота взята в руки!");
+    }
+
+    public void Drop()
+    {
+        isHeld = false;
+
+        transform.SetParent(originalParent);
+        transform.localPosition = originalLocalPos;
+        transform.localRotation = originalLocalRot;
+        transform.localScale = originalLocalScale;
+
+        if (rb)
         {
-            objectCollider.isTrigger = true;
+            rb.isKinematic = false;
+            rb.useGravity = true;
+            rb.constraints = RigidbodyConstraints.None; // или что было изначально
         }
-        
-        // Останавливаем визуальное переключение если есть
-        if (visualSwitcher != null)
-        {
-            visualSwitcher.enabled = false;
-        }
-        
-        // Эффекты
-        PlayPickupEffects();
+
+        if (col) col.isTrigger = false;
+        visual.enabled = true;
+        if (ghost) ghost.SetActive(false);
+
+        Debug.Log("Сота возвращена на место");
     }
-    
-    void UpdateCarriedObject()
+
+    void HandleRotation()
+{
+    float input = 0f;
+    if (Input.GetKey(rotateLeftKey)) input -= 1f;
+    if (Input.GetKey(rotateRightKey)) input += 1f;
+
+    if (input != 0f)
     {
-        if (carriedObject == null) return;
-        
-        Camera playerCamera = Camera.main;
-        if (playerCamera == null) return;
-        
-        // Вычисляем целевую позицию перед камерой
-        targetPosition = playerCamera.transform.position + 
-                        playerCamera.transform.forward * holdDistance;
-        
-        // Плавное перемещение
-        carriedObject.position = Vector3.Lerp(
-            carriedObject.position, 
-            targetPosition, 
-            smoothSpeed * Time.deltaTime
-        );
-        
-        // Сохраняем оригинальный поворот или поворачиваем к камере
-        if (!allowRotation)
-        {
-            targetRotation = Quaternion.LookRotation(
-                playerCamera.transform.forward, 
-                Vector3.up
-            );
-            
-            carriedObject.rotation = Quaternion.Slerp(
-                carriedObject.rotation,
-                targetRotation,
-                smoothSpeed * Time.deltaTime
-            );
-        }
+        // Локальная ось Y объекта, чтобы вращение было визуально ожидаемым
+        transform.Rotate(Vector3.up, input * rotationSpeed * Time.deltaTime, Space.Self);
     }
-    
-    void HandleRotationInput()
-    {
-        if (!allowRotation) return;
-        
-        float rotationInput = 0f;
-        
-        if (Input.GetKey(rotateLeftKey))
-            rotationInput = -1f;
-        else if (Input.GetKey(rotateRightKey))
-            rotationInput = 1f;
-        
-        if (rotationInput != 0f)
-        {
-            carriedObject.Rotate(
-                Vector3.up, 
-                rotationInput * rotationSpeed * Time.deltaTime * 100f, 
-                Space.World
-            );
-        }
-    }
-    
-    bool ShouldDropObject()
-    {
-        if (carriedObject == null) return true;
-        
-        Camera playerCamera = Camera.main;
-        if (playerCamera == null) return true;
-        
-        float distance = Vector3.Distance(carriedObject.position, playerCamera.transform.position);
-        return distance > pickupDistance * 1.5f;
-    }
-    
-    public void DropObject()
-    {
-        if (!isCarrying) return;
-        
-        isCarrying = false;
-        
-        // Восстанавливаем оригинальную позицию и поворот
-        transform.position = originalPosition;
-        transform.rotation = originalRotation;
-        // МАСШТАБ НЕ ТРОГАЕМ - оставляем как есть
-        
-        // Восстанавливаем физику
-        if (rb != null)
-        {
-            rb.isKinematic = wasKinematic;
-            rb.useGravity = usedGravity;
-        }
-        
-        // Восстанавливаем коллайдер
-        if (objectCollider != null)
-        {
-            objectCollider.isTrigger = false;
-        }
-        
-        // Включаем обратно визуальное переключение
-        if (visualSwitcher != null)
-        {
-            visualSwitcher.enabled = true;
-        }
-        
-        // Эффекты
-        PlayDropEffects();
-        
-        carriedObject = null;
-    }
-    
-    void PlayPickupEffects()
-    {
-        if (pickupParticles != null)
-            pickupParticles.Play();
-            
-        if (pickupSound != null && audioSource != null)
-            audioSource.PlayOneShot(pickupSound);
-    }
-    
-    void PlayDropEffects()
-    {
-        if (dropSound != null && audioSource != null)
-            audioSource.PlayOneShot(dropSound);
-    }
-    
-    // Метод для принудительного сохранения текущей позиции как оригинальной
-    public void SetCurrentAsOriginal()
-    {
-        originalPosition = transform.position;
-        originalRotation = transform.rotation;
-    }
-    
-    // Методы для внешнего управления
-    public bool IsCarrying()
-    {
-        return isCarrying;
-    }
-    
-    public void ForceDrop()
-    {
-        DropObject();
-    }
-    
-    // Визуальная подсказка в редакторе
+}
+
+
     void OnDrawGizmosSelected()
     {
-        // Показываем дистанцию поднятия
-        Gizmos.color = Color.yellow;
-        Gizmos.DrawWireSphere(transform.position, pickupDistance);
-        
-        // Показываем оригинальную позицию
-        Gizmos.color = Color.blue;
-        Gizmos.DrawWireCube(originalPosition, Vector3.one * 0.1f);
-        
-        // Если несем объект - показываем точку удержания
-        if (isCarrying && Camera.main != null)
+        if (camTransform)
         {
-            Vector3 holdPoint = Camera.main.transform.position + 
-                               Camera.main.transform.forward * holdDistance;
-            Gizmos.color = Color.green;
-            Gizmos.DrawWireSphere(holdPoint, 0.1f);
-            Gizmos.DrawLine(Camera.main.transform.position, holdPoint);
+            Gizmos.color = Color.cyan;
+            Gizmos.DrawRay(camTransform.position, camTransform.forward * pickupDistance);
         }
     }
 }
